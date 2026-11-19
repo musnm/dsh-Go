@@ -30,8 +30,10 @@ permissions:
   contents: write
 
 concurrency:
-  group: ios-ipa-${{ github.ref }}
-  cancel-in-progress: true
+  # 手动/同步触发与 push 触发分开排队，避免互相取消。
+  # push 事件没有 inputs，用 event_name 兜底。
+  group: ios-ipa-${{ github.event_name }}-${{ github.sha }}
+  cancel-in-progress: false
 
 jobs:
   ipa:
