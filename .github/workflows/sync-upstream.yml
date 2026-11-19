@@ -1,0 +1,89 @@
+# 每 6 小时检查上游 ccch1mneyyy/dsh-Go 是否有新提交。
+# 有新提交 → 自动快进合并到本 fork 的 main。
+# main 变更会触发 ios-ipa.yml（paths 已放开 app/** 等），从而自动出包。
+name: Sync upstream
+
+on:
+  schedule:
+    # 每 6 小时（UTC）：00:17 / 06:17 / 12:17 / 18:17，错开整点避开调度高峰
+    - cron: '17 0,6,12,18 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 配置 git
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: 拉取上游
+        id: up
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/ccch1mneyyy/dsh-Go.git
+          git fetch --quiet upstream main
+          UP="$(git rev-parse upstream/main)"
+          CUR="$(git rev-parse HEAD)"
+          echo "upstream=$UP"
+          echo "current =$CUR"
+          echo "upstream_sha=$UP" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "$UP" "$CUR"; then
+            echo "已是最新，无需同步"
+            echo "need=false" >> "$GITHUB_OUTPUT"
+          else
+            BEHIND="$(git rev-list --count "$CUR..$UP")"
+            echo "落后上游 $BEHIND 个提交"
+            echo "need=true"   >> "$GITHUB_OUTPUT"
+            echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 合并上游
+        if: steps.up.outputs.need == 'true'
+        id: merge
+        run: |
+          set -euo pipefail
+          if git merge --no-edit "upstream/main"; then
+            echo "自动合并成功"
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error title=合并冲突::上游改动与本地 .github/workflows/ 冲突，需人工处理"
+            git merge --abort || true
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      - name: 推送
+        if: steps.up.outputs.need == 'true' && steps.merge.outputs.ok == 'true'
+        run: |
+          set -euo pipefail
+          git push origin HEAD:main
+          echo "已同步到 $(git rev-parse --short HEAD)"
+
+      - name: 汇总
+        if: always()
+        run: |
+          {
+            echo "### 上游同步结果"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 上游 HEAD | \`${{ steps.up.outputs.upstream_sha }}\` |"
+            echo "| 需要同步 | ${{ steps.up.outputs.need }} |"
+            echo "| 落后提交数 | ${{ steps.up.outputs.behind || '0' }} |"
+            echo "| 当前 HEAD | \`$(git rev-parse HEAD)\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
