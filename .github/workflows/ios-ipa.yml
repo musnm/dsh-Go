@@ -1,4 +1,4 @@
-# 产出未签名 IPA：准备引擎 → 编译 iSH → 编译 Flutter 设备包 → 打包 Payload。
+# 产出未签名 IPA：准备引擎 → 编译 iSH → 编译 Flutter 设备包 → 打包 Payload → 发 Release。
 # 不签名（无证书），拿到后用 TrollStore / Sideloadly / AltStore 自签安装。
 name: iOS IPA
 
@@ -9,8 +9,9 @@ on:
     paths:
       - '.github/workflows/ios-ipa.yml'
 
+# contents: write —— 发布 Release 需要
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: ios-ipa-${{ github.ref }}
@@ -206,11 +207,78 @@ jobs:
           ls -lh dsh-go-unsigned.ipa
           unzip -l dsh-go-unsigned.ipa | head -n 25
 
-      - name: 上传 IPA
+      # ---------------- 元数据（版本号 / tag） ----------------
+      - name: 读取版本与生成 tag
+        id: meta
+        run: |
+          set -euo pipefail
+          VER="$(sed -n 's/^version:[[:space:]]*\([0-9][0-9.]*\)+.*/\1/p' app/pubspec.yaml | head -n1)"
+          BUILD="$(sed -n 's/^version:[[:space:]]*[0-9][0-9.]*+\([0-9][0-9]*\).*/\1/p' app/pubspec.yaml | head -n1)"
+          SHORT="${GITHUB_SHA::7}"
+          TAG="ipa-${VER}-${BUILD}-r${GITHUB_RUN_NUMBER}-${SHORT}"
+          echo "version=$VER"   >> "$GITHUB_OUTPUT"
+          echo "build=$BUILD"   >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG"       >> "$GITHUB_OUTPUT"
+          echo "版本 $VER ($BUILD) → tag $TAG"
+
+      - name: 生成校验文件
+        run: |
+          set -euo pipefail
+          cd out
+          shasum -a 256 dsh-go-unsigned.ipa > dsh-go-unsigned.ipa.sha256
+          cat dsh-go-unsigned.ipa.sha256
+          ls -lh
+
+      # ---------------- 发布 ----------------
+      # 直链形式：
+      #   https://github.com/<owner>/<repo>/releases/download/<tag>/dsh-go-unsigned.ipa
+      # 手机上点开即可下载，无需解压、无需登录。
+      - name: 发布 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: dsh-go v${{ steps.meta.outputs.version }} (${{ steps.meta.outputs.build }}) · run ${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          draft: false
+          prerelease: false
+          make_latest: true
+          fail_on_unmatched_files: true
+          files: |
+            out/dsh-go-unsigned.ipa
+            out/dsh-go-unsigned.ipa.sha256
+          body: |
+            ## dsh-go 未签名 IPA
+
+            | 项 | 值 |
+            |---|---|
+            | 版本 | `${{ steps.meta.outputs.version }}`（build `${{ steps.meta.outputs.build }}`）|
+            | 提交 | `${{ github.sha }}` |
+            | 运行 | [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
+            | 平台 | iOS 16+ / arm64 |
+            | 签名 | **未签名** |
+
+            ### 安装
+
+            1. 下载下面的 `dsh-go-unsigned.ipa`
+            2. 用 **TrollStore** 直接安装，或用 Sideloadly / AltStore / Feather 自签
+            3. 校验：`shasum -a 256 dsh-go-unsigned.ipa`
+
+            ### 已内嵌
+
+            - `NodeMobile`（Node 引擎）
+            - `DshNodeHost` / `DshFlock` / `DshRequireBuiltin`
+            - `DshGuest` / `DshGuestBridge`（iSH guest + N-API 桥）
+
+            构建于 GitHub Actions `macos-26`，Xcode 26.6，Flutter 3.47.7。
+
+      # ---------------- 备份 artifact ----------------
+      - name: 上传 IPA 备份
         uses: actions/upload-artifact@v4
         with:
           name: dsh-go-unsigned-ipa
-          path: out/dsh-go-unsigned.ipa
+          path: |
+            out/dsh-go-unsigned.ipa
+            out/dsh-go-unsigned.ipa.sha256
           if-no-files-found: error
           retention-days: 30
 
