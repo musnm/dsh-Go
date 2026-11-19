@@ -83,22 +83,28 @@ jobs:
           A=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json")
           BR="sync/upstream-$(date +%Y%m%d%H%M%S)"
 
-          curl -fsSL -X POST "${A[@]}" "$API/repos/$FORK/git/refs" \
-            -d "{\"ref\":\"refs/heads/$BR\",\"sha\":\"${{ steps.chk.outputs.upstream_sha }}\"}" > /dev/null
+          CODE="$(curl -sS -o /tmp/ref.json -w '%{http_code}' -X POST "${A[@]}" "$API/repos/$FORK/git/refs" \
+            -d "{\"ref\":\"refs/heads/$BR\",\"sha\":\"${{ steps.chk.outputs.upstream_sha }}\"}")"
+          echo "创建分支 HTTP $CODE"
+          cat /tmp/ref.json; echo
+          [ "$CODE" = "201" ] || { echo "::error title=建分支失败::HTTP $CODE"; exit 1; }
           echo "临时分支 $BR 已建立"
 
-          RESP="$(curl -fsSL -X POST "${A[@]}" "$API/repos/$FORK/merges" \
+          CODE="$(curl -sS -o /tmp/merge.json -w '%{http_code}' -X POST "${A[@]}" "$API/repos/$FORK/merges" \
             -d "{\"base\":\"$BR\",\"head\":\"main\",\"commit_message\":\"chore: 同步上游 ${{ steps.chk.outputs.upstream_sha }}\"}")"
-          MERGED="$(echo "$RESP" | jq -r '.sha // empty')"
+          echo "合并 HTTP $CODE"
+          cat /tmp/merge.json; echo
+          MERGED="$(jq -r '.sha // empty' /tmp/merge.json)"
 
           if [ -z "$MERGED" ]; then
-            echo "::error title=合并冲突::上游与本地改动冲突，需人工处理。临时分支 $BR 已保留。"
+            echo "::error title=合并失败::HTTP $CODE，临时分支 $BR 已保留"
             exit 1
           fi
           echo "合并提交 $MERGED"
 
           curl -fsSL -X PATCH "${A[@]}" "$API/repos/$FORK/git/refs/heads/main" \
-            -d "{\"sha\":\"$MERGED\",\"force\":false}" > /dev/null
+            -d "{\"sha\":\"$MERGED\",\"force\":false}" > /dev/null || {
+              echo "::error title=更新 main 失败::合并提交 $MERGED 无法快进 main"; exit 1; }
           echo "main 已更新到 $MERGED"
 
           curl -fsSL -X DELETE "${A[@]}" "$API/repos/$FORK/git/refs/heads/$BR" > /dev/null || true
