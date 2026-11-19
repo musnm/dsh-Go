@@ -1,11 +1,12 @@
 # 每 6 小时检查上游 ccch1mneyyy/dsh-Go 是否有新提交。
-# 有新提交 → 自动快进合并到本 fork 的 main。
+# 有新提交 → 用 GitHub REST API 更新本 fork 的 main（fork 仓库的
+# GITHUB_TOKEN 没有 git push 权限，所以走 API）。
 # main 变更会触发 ios-ipa.yml（paths 已放开 app/** 等），从而自动出包。
 name: Sync upstream
 
 on:
   schedule:
-    # 每 6 小时（UTC）：00:17 / 06:17 / 12:17 / 18:17，错开整点避开调度高峰
+    # 每 6 小时（UTC）：00:17 / 06:17 / 12:17 / 18:17，错开整点
     - cron: '17 0,6,12,18 * * *'
   workflow_dispatch:
 
@@ -16,63 +17,92 @@ concurrency:
   group: sync-upstream
   cancel-in-progress: false
 
+env:
+  UPSTREAM: ccch1mneyyy/dsh-Go
+  FORK: musnm/dsh-Go
+  API: https://api.github.com
+
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: 配置 git
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-      - name: 拉取上游
-        id: up
+      - name: 检查上游
+        id: chk
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          git remote add upstream https://github.com/ccch1mneyyy/dsh-Go.git
-          git fetch --quiet upstream main
-          UP="$(git rev-parse upstream/main)"
-          CUR="$(git rev-parse HEAD)"
-          echo "upstream=$UP"
-          echo "current =$CUR"
+          A=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json")
+
+          UP="$(curl -fsSL "${A[@]}" "$API/repos/$UPSTREAM/commits/main" | jq -r .sha)"
+          CUR="$(curl -fsSL "${A[@]}" "$API/repos/$FORK/commits/main" | jq -r .sha)"
+          echo "上游 HEAD : $UP"
+          echo "本地 HEAD : $CUR"
           echo "upstream_sha=$UP" >> "$GITHUB_OUTPUT"
-          if git merge-base --is-ancestor "$UP" "$CUR"; then
-            echo "已是最新，无需同步"
-            echo "need=false" >> "$GITHUB_OUTPUT"
-          else
-            BEHIND="$(git rev-list --count "$CUR..$UP")"
-            echo "落后上游 $BEHIND 个提交"
-            echo "need=true"   >> "$GITHUB_OUTPUT"
-            echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          echo "current_sha=$CUR"  >> "$GITHUB_OUTPUT"
+
+          if [ "$UP" = "$CUR" ]; then
+            echo "已是最新"
+            echo "need=none" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
-      - name: 合并上游
-        if: steps.up.outputs.need == 'true'
-        id: merge
+          CMP="$(curl -fsSL "${A[@]}" "$API/repos/$FORK/compare/$CUR...$UP")"
+          ST="$(echo "$CMP" | jq -r .status)"
+          AHEAD="$(echo "$CMP" | jq -r .ahead_by)"
+          echo "compare: status=$ST ahead=$AHEAD"
+          echo "status=$ST"  >> "$GITHUB_OUTPUT"
+          echo "ahead=$AHEAD" >> "$GITHUB_OUTPUT"
+
+          if [ "$ST" = "ahead" ] || [ "$ST" = "identical" ]; then
+            echo "need=fast-forward" >> "$GITHUB_OUTPUT"
+          else
+            echo "need=merge" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 快进 main
+        if: steps.chk.outputs.need == 'fast-forward'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          if git merge --no-edit "upstream/main"; then
-            echo "自动合并成功"
-            echo "ok=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::error title=合并冲突::上游改动与本地 .github/workflows/ 冲突，需人工处理"
-            git merge --abort || true
-            echo "ok=false" >> "$GITHUB_OUTPUT"
+          curl -fsSL -X PATCH \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$API/repos/$FORK/git/refs/heads/main" \
+            -d "{\"sha\":\"${{ steps.chk.outputs.upstream_sha }}\",\"force\":false}" > /dev/null
+          echo "main 已快进到 ${{ steps.chk.outputs.upstream_sha }}"
+
+      - name: 合并上游（有本地提交时）
+        if: steps.chk.outputs.need == 'merge'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          A=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json")
+          BR="sync/upstream-$(date +%Y%m%d%H%M%S)"
+
+          curl -fsSL -X POST "${A[@]}" "$API/repos/$FORK/git/refs" \
+            -d "{\"ref\":\"refs/heads/$BR\",\"sha\":\"${{ steps.chk.outputs.upstream_sha }}\"}" > /dev/null
+          echo "临时分支 $BR 已建立"
+
+          RESP="$(curl -fsSL -X POST "${A[@]}" "$API/repos/$FORK/merges" \
+            -d "{\"base\":\"$BR\",\"head\":\"main\",\"commit_message\":\"chore: 同步上游 ${{ steps.chk.outputs.upstream_sha }}\"}")"
+          MERGED="$(echo "$RESP" | jq -r '.sha // empty')"
+
+          if [ -z "$MERGED" ]; then
+            echo "::error title=合并冲突::上游与本地改动冲突，需人工处理。临时分支 $BR 已保留。"
             exit 1
           fi
+          echo "合并提交 $MERGED"
 
-      - name: 推送
-        if: steps.up.outputs.need == 'true' && steps.merge.outputs.ok == 'true'
-        run: |
-          set -euo pipefail
-          git push origin HEAD:main
-          echo "已同步到 $(git rev-parse --short HEAD)"
+          curl -fsSL -X PATCH "${A[@]}" "$API/repos/$FORK/git/refs/heads/main" \
+            -d "{\"sha\":\"$MERGED\",\"force\":false}" > /dev/null
+          echo "main 已更新到 $MERGED"
+
+          curl -fsSL -X DELETE "${A[@]}" "$API/repos/$FORK/git/refs/heads/$BR" > /dev/null || true
+          echo "临时分支已清理"
 
       - name: 汇总
         if: always()
@@ -82,8 +112,8 @@ jobs:
             echo ""
             echo "| 项 | 值 |"
             echo "|---|---|"
-            echo "| 上游 HEAD | \`${{ steps.up.outputs.upstream_sha }}\` |"
-            echo "| 需要同步 | ${{ steps.up.outputs.need }} |"
-            echo "| 落后提交数 | ${{ steps.up.outputs.behind || '0' }} |"
-            echo "| 当前 HEAD | \`$(git rev-parse HEAD)\` |"
+            echo "| 上游 HEAD | \`${{ steps.chk.outputs.upstream_sha }}\` |"
+            echo "| 同步前 HEAD | \`${{ steps.chk.outputs.current_sha }}\` |"
+            echo "| 判定 | ${{ steps.chk.outputs.need }} |"
+            echo "| 落后提交数 | ${{ steps.chk.outputs.ahead || '0' }} |"
           } >> "$GITHUB_STEP_SUMMARY"
