@@ -26,6 +26,9 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: 检查上游
         id: chk
@@ -33,10 +36,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          A=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json")
+          gh_get() { curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                        -H "Accept: application/vnd.github+json" "$1"; }
 
-          UP="$(curl -fsSL "${A[@]}" "$API/repos/$UPSTREAM/commits/main" | jq -r .sha)"
-          CUR="$(curl -fsSL "${A[@]}" "$API/repos/$FORK/commits/main" | jq -r .sha)"
+          UP="$(gh_get "$API/repos/$UPSTREAM/commits/main" | jq -r .sha)"
+          CUR="$(gh_get "$API/repos/$FORK/commits/main" | jq -r .sha)"
           echo "上游 HEAD : $UP"
           echo "本地 HEAD : $CUR"
           echo "upstream_sha=$UP" >> "$GITHUB_OUTPUT"
@@ -48,7 +52,7 @@ jobs:
             exit 0
           fi
 
-          CMP="$(curl -fsSL "${A[@]}" "$API/repos/$FORK/compare/$CUR...$UP")"
+          CMP="$(gh_get "$API/repos/$FORK/compare/$CUR...$UP")"
           ST="$(echo "$CMP" | jq -r .status)"
           AHEAD="$(echo "$CMP" | jq -r .ahead_by)"
           echo "compare: status=$ST ahead=$AHEAD"
@@ -67,11 +71,14 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          curl -fsSL -X PATCH \
+          CODE="$(curl -sS -o /tmp/patch.json -w '%{http_code}' -X PATCH \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "$API/repos/$FORK/git/refs/heads/main" \
-            -d "{\"sha\":\"${{ steps.chk.outputs.upstream_sha }}\",\"force\":false}" > /dev/null
+            -d "{\"sha\":\"${{ steps.chk.outputs.upstream_sha }}\",\"force\":false}")"
+          echo "PATCH main HTTP $CODE"
+          cat /tmp/patch.json; echo
+          [ "$CODE" = "200" ] || { echo "::error title=快进失败::HTTP $CODE"; exit 1; }
           echo "main 已快进到 ${{ steps.chk.outputs.upstream_sha }}"
 
       - name: 合并上游（有本地提交时）
@@ -80,17 +87,20 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          A=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json")
+          AUTH1="Authorization: Bearer $GH_TOKEN"
+          AUTH2="Accept: application/vnd.github+json"
           BR="sync/upstream-$(date +%Y%m%d%H%M%S)"
 
-          CODE="$(curl -sS -o /tmp/ref.json -w '%{http_code}' -X POST "${A[@]}" "$API/repos/$FORK/git/refs" \
+          CODE="$(curl -sS -o /tmp/ref.json -w '%{http_code}' -X POST \
+            -H "$AUTH1" -H "$AUTH2" "$API/repos/$FORK/git/refs" \
             -d "{\"ref\":\"refs/heads/$BR\",\"sha\":\"${{ steps.chk.outputs.upstream_sha }}\"}")"
           echo "创建分支 HTTP $CODE"
           cat /tmp/ref.json; echo
           [ "$CODE" = "201" ] || { echo "::error title=建分支失败::HTTP $CODE"; exit 1; }
           echo "临时分支 $BR 已建立"
 
-          CODE="$(curl -sS -o /tmp/merge.json -w '%{http_code}' -X POST "${A[@]}" "$API/repos/$FORK/merges" \
+          CODE="$(curl -sS -o /tmp/merge.json -w '%{http_code}' -X POST \
+            -H "$AUTH1" -H "$AUTH2" "$API/repos/$FORK/merges" \
             -d "{\"base\":\"$BR\",\"head\":\"main\",\"commit_message\":\"chore: 同步上游 ${{ steps.chk.outputs.upstream_sha }}\"}")"
           echo "合并 HTTP $CODE"
           cat /tmp/merge.json; echo
@@ -102,12 +112,16 @@ jobs:
           fi
           echo "合并提交 $MERGED"
 
-          curl -fsSL -X PATCH "${A[@]}" "$API/repos/$FORK/git/refs/heads/main" \
-            -d "{\"sha\":\"$MERGED\",\"force\":false}" > /dev/null || {
-              echo "::error title=更新 main 失败::合并提交 $MERGED 无法快进 main"; exit 1; }
+          CODE="$(curl -sS -o /tmp/patch2.json -w '%{http_code}' -X PATCH \
+            -H "$AUTH1" -H "$AUTH2" "$API/repos/$FORK/git/refs/heads/main" \
+            -d "{\"sha\":\"$MERGED\",\"force\":false}")"
+          echo "PATCH main HTTP $CODE"
+          cat /tmp/patch2.json; echo
+          [ "$CODE" = "200" ] || { echo "::error title=更新 main 失败::HTTP $CODE"; exit 1; }
           echo "main 已更新到 $MERGED"
 
-          curl -fsSL -X DELETE "${A[@]}" "$API/repos/$FORK/git/refs/heads/$BR" > /dev/null || true
+          curl -sS -o /dev/null -X DELETE -H "$AUTH1" -H "$AUTH2" \
+            "$API/repos/$FORK/git/refs/heads/$BR" || true
           echo "临时分支已清理"
 
       - name: 汇总
