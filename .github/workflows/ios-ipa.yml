@@ -6,8 +6,15 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
+    # 上游同步 / 主人改代码都会触发。文档类改动不触发，省 macOS 额度。
     paths:
       - '.github/workflows/ios-ipa.yml'
+      - 'app/**'
+      - 'runtime/**'
+      - 'tooling/**'
+      - 'flutter/**'
+      - 'pubspec.yaml'
+      - 'pubspec.lock'
 
 # contents: write —— 发布 Release 需要
 permissions:
