@@ -1,7 +1,7 @@
 # 每 6 小时检查上游 ccch1mneyyy/dsh-Go 是否有新提交。
-# 有新提交 → 用 GitHub REST API 更新本 fork 的 main（fork 仓库的
-# GITHUB_TOKEN 没有 git push 权限，所以走 API）。
-# main 变更会触发 ios-ipa.yml（paths 已放开 app/** 等），从而自动出包。
+# fork 仓库的 GITHUB_TOKEN 没有写权限（无法 push / 改 ref），
+# 所以这里只做检测，检测到新提交就直接 workflow_dispatch 触发 ios-ipa.yml，
+# 让它用 source_repo=上游 去拉源码编译。
 name: Sync upstream
 
 on:
@@ -11,7 +11,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+  actions: write   # 触发 workflow_dispatch 需要
 
 concurrency:
   group: sync-upstream
@@ -30,7 +31,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - name: 检查上游
+      - name: 检查上游是否有新提交
         id: chk
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -46,94 +47,49 @@ jobs:
           echo "upstream_sha=$UP" >> "$GITHUB_OUTPUT"
           echo "current_sha=$CUR"  >> "$GITHUB_OUTPUT"
 
-          if [ "$UP" = "$CUR" ]; then
-            echo "已是最新"
-            echo "need=none" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
+          # 上次编译过的上游 commit 记在变量里（用 Actions variable 存不了，
+          # 所以改成：用上游 commit 是否已经存在于本仓库历史来判断）。
+          # 上游不是本仓库祖先 → 说明没编过或上游又更新了。
           CMP="$(gh_get "$API/repos/$FORK/compare/$CUR...$UP")"
           ST="$(echo "$CMP" | jq -r .status)"
           AHEAD="$(echo "$CMP" | jq -r .ahead_by)"
           echo "compare: status=$ST ahead=$AHEAD"
-          echo "status=$ST"  >> "$GITHUB_OUTPUT"
           echo "ahead=$AHEAD" >> "$GITHUB_OUTPUT"
 
-          if [ "$ST" = "ahead" ] || [ "$ST" = "identical" ]; then
-            echo "need=fast-forward" >> "$GITHUB_OUTPUT"
+          if [ "$ST" = "identical" ] || [ "$ST" = "behind" ]; then
+            echo "本仓库已包含上游最新代码，无需编译"
+            echo "need=false" >> "$GITHUB_OUTPUT"
           else
-            echo "need=merge" >> "$GITHUB_OUTPUT"
+            echo "上游领先 $AHEAD 个提交，触发编译"
+            echo "need=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: 快进 main
-        if: steps.chk.outputs.need == 'fast-forward'
+      - name: 触发 iOS IPA 编译（用上游源码）
+        if: steps.chk.outputs.need == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          CODE="$(curl -sS -o /tmp/patch.json -w '%{http_code}' -X PATCH \
+          CODE="$(curl -sS -o /tmp/disp.json -w '%{http_code}' -X POST \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            "$API/repos/$FORK/git/refs/heads/main" \
-            -d "{\"sha\":\"${{ steps.chk.outputs.upstream_sha }}\",\"force\":false}")"
-          echo "PATCH main HTTP $CODE"
-          cat /tmp/patch.json; echo
-          [ "$CODE" = "200" ] || { echo "::error title=快进失败::HTTP $CODE"; exit 1; }
-          echo "main 已快进到 ${{ steps.chk.outputs.upstream_sha }}"
-
-      - name: 合并上游（有本地提交时）
-        if: steps.chk.outputs.need == 'merge'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          AUTH1="Authorization: Bearer $GH_TOKEN"
-          AUTH2="Accept: application/vnd.github+json"
-          BR="sync/upstream-$(date +%Y%m%d%H%M%S)"
-
-          CODE="$(curl -sS -o /tmp/ref.json -w '%{http_code}' -X POST \
-            -H "$AUTH1" -H "$AUTH2" "$API/repos/$FORK/git/refs" \
-            -d "{\"ref\":\"refs/heads/$BR\",\"sha\":\"${{ steps.chk.outputs.upstream_sha }}\"}")"
-          echo "创建分支 HTTP $CODE"
-          cat /tmp/ref.json; echo
-          [ "$CODE" = "201" ] || { echo "::error title=建分支失败::HTTP $CODE"; exit 1; }
-          echo "临时分支 $BR 已建立"
-
-          CODE="$(curl -sS -o /tmp/merge.json -w '%{http_code}' -X POST \
-            -H "$AUTH1" -H "$AUTH2" "$API/repos/$FORK/merges" \
-            -d "{\"base\":\"$BR\",\"head\":\"main\",\"commit_message\":\"chore: 同步上游 ${{ steps.chk.outputs.upstream_sha }}\"}")"
-          echo "合并 HTTP $CODE"
-          cat /tmp/merge.json; echo
-          MERGED="$(jq -r '.sha // empty' /tmp/merge.json)"
-
-          if [ -z "$MERGED" ]; then
-            echo "::error title=合并失败::HTTP $CODE，临时分支 $BR 已保留"
-            exit 1
-          fi
-          echo "合并提交 $MERGED"
-
-          CODE="$(curl -sS -o /tmp/patch2.json -w '%{http_code}' -X PATCH \
-            -H "$AUTH1" -H "$AUTH2" "$API/repos/$FORK/git/refs/heads/main" \
-            -d "{\"sha\":\"$MERGED\",\"force\":false}")"
-          echo "PATCH main HTTP $CODE"
-          cat /tmp/patch2.json; echo
-          [ "$CODE" = "200" ] || { echo "::error title=更新 main 失败::HTTP $CODE"; exit 1; }
-          echo "main 已更新到 $MERGED"
-
-          curl -sS -o /dev/null -X DELETE -H "$AUTH1" -H "$AUTH2" \
-            "$API/repos/$FORK/git/refs/heads/$BR" || true
-          echo "临时分支已清理"
+            "$API/repos/$FORK/actions/workflows/ios-ipa.yml/dispatches" \
+            -d "{\"ref\":\"main\",\"inputs\":{\"source_repo\":\"$UPSTREAM\",\"source_ref\":\"${{ steps.chk.outputs.upstream_sha }}\"}}")"
+          echo "dispatch HTTP $CODE"
+          cat /tmp/disp.json; echo
+          [ "$CODE" = "204" ] || { echo "::error title=触发失败::HTTP $CODE"; exit 1; }
+          echo "已触发编译：$UPSTREAM@${{ steps.chk.outputs.upstream_sha }}"
 
       - name: 汇总
         if: always()
         run: |
           {
-            echo "### 上游同步结果"
+            echo "### 上游同步检查"
             echo ""
             echo "| 项 | 值 |"
             echo "|---|---|"
             echo "| 上游 HEAD | \`${{ steps.chk.outputs.upstream_sha }}\` |"
-            echo "| 同步前 HEAD | \`${{ steps.chk.outputs.current_sha }}\` |"
-            echo "| 判定 | ${{ steps.chk.outputs.need }} |"
-            echo "| 落后提交数 | ${{ steps.chk.outputs.ahead || '0' }} |"
+            echo "| 本仓库 HEAD | \`${{ steps.chk.outputs.current_sha }}\` |"
+            echo "| 上游领先 | ${{ steps.chk.outputs.ahead || '0' }} |"
+            echo "| 是否触发编译 | ${{ steps.chk.outputs.need }} |"
           } >> "$GITHUB_STEP_SUMMARY"
