@@ -4,6 +4,15 @@ name: iOS IPA
 
 on:
   workflow_dispatch:
+    inputs:
+      source_repo:
+        description: '源码仓库（留空=本仓库，填 ccch1mneyyy/dsh-Go 则编译上游）'
+        required: false
+        default: ''
+      source_ref:
+        description: '源码分支/提交'
+        required: false
+        default: 'main'
   push:
     branches: [main]
     # 上游同步 / 主人改代码都会触发。文档类改动不触发，省 macOS 额度。
@@ -39,9 +48,24 @@ jobs:
       DSH_IOS_ENGINE_WORK: ${{ github.workspace }}/../engine-work
 
     steps:
+      # 默认编译本仓库；若指定了 source_repo（上游同步触发），改拉上游代码。
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+
+      - name: 切换到上游源码
+        if: inputs.source_repo != ''
+        env:
+          SRC_REPO: ${{ inputs.source_repo }}
+          SRC_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          echo "拉取 $SRC_REPO@$SRC_REF"
+          git remote add src "https://github.com/$SRC_REPO.git"
+          git fetch --depth 1 src "$SRC_REF"
+          # 只覆盖代码，保留本仓库的 .github（工作流自身不受影响）
+          git checkout FETCH_HEAD -- . ':(exclude).github'
+          echo "当前内容来自 $SRC_REPO@$(git rev-parse FETCH_HEAD)"
 
       - name: 环境自检
         run: |
@@ -259,7 +283,7 @@ jobs:
             | 项 | 值 |
             |---|---|
             | 版本 | `${{ steps.meta.outputs.version }}`（build `${{ steps.meta.outputs.build }}`）|
-            | 提交 | `${{ github.sha }}` |
+            | 源码 | `${{ inputs.source_repo || 'musnm/dsh-Go' }}` @ `${{ inputs.source_ref || github.sha }}` |
             | 运行 | [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
             | 平台 | iOS 16+ / arm64 |
             | 签名 | **未签名** |
